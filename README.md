@@ -1,8 +1,24 @@
 # omarchy-plugin-guard
 
-<p align="center">
-  <img src="docs/how-it-works.png" alt="Inspection line: fetch the incoming commit without touching live plugins, scan it, send the diff to a read-only Cursor agent, then allow, ask a human, or deny. Only an accepted SHA is fast-forwarded into ~/.config/omarchy/plugins." width="100%">
-</p>
+```mermaid
+flowchart TD
+  start["omarchy-plugin-guard add / update"] --> fetch["git fetch or clone"]
+  fetch --> snap["Snapshot FETCH_HEAD<br/>live plugins dir is not written"]
+  snap --> scan["Mechanical scan<br/>Process, network, pipe-to-shell,<br/>credential paths, new binaries"]
+  scan --> agent["Read-only Cursor agent<br/>tools: read, grep, glob, ls"]
+  agent --> verdict{"Combined verdict"}
+
+  verdict -->|allow| confirm["prompt, or --yes"]
+  verdict -->|needs-human| human["print reasons, then y/n<br/>--yes does not skip this"]
+  verdict -->|deny| stop["do not merge<br/>--force does not override"]
+
+  confirm -->|yes| merge["git merge --ff-only<br/>reviewed SHA only"]
+  human -->|accept| merge
+  human -->|reject| skip["skip"]
+  merge --> validate["omarchy plugin validate"]
+  validate -->|ok| live["~/.config/omarchy/plugins"]
+  validate -->|fail| rollback["reset to previous HEAD"]
+```
 
 Omarchy shell plugins are unsandboxed QML inside the long-lived `omarchy-shell` process. `omarchy plugin validate` only checks the manifest. This CLI reviews the **incoming git commit** and merges **that SHA only** — it never fetches again after the review.
 
