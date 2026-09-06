@@ -85,4 +85,4 @@ State: `~/.config/omarchy/plugin-guard/` (`baselines/`, `reviews/`).
 
 ## License
 
-MIT
+[MIT](LICENSE). You may use, copy, modify, and distribute this without asking.
