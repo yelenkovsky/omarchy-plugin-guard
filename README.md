@@ -1,62 +1,57 @@
 # omarchy-plugin-guard
 
-Review Omarchy shell plugin updates **before** they merge into `~/.config/omarchy/plugins`.
+<p align="center">
+  <img src="docs/how-it-works.png" alt="Inspection line: fetch the incoming commit without touching live plugins, scan it, send the diff to a read-only Cursor agent, then allow, ask a human, or deny. Only an accepted SHA is fast-forwarded into ~/.config/omarchy/plugins." width="100%">
+</p>
 
-Plugins run unsandboxed inside the long-lived `omarchy-shell` process. `omarchy plugin validate` only checks the manifest schema. This tool:
+Omarchy shell plugins are unsandboxed QML inside the long-lived `omarchy-shell` process. `omarchy plugin validate` only checks the manifest. This CLI reviews the **incoming git commit** and merges **that SHA only** — it never fetches again after the review.
 
-1. `git fetch`es without touching the live tree
-2. Snapshots `FETCH_HEAD` and runs mechanical gates on the incoming tree
-3. Compares capabilities against the previous commit (and a stored baseline)
-4. Sends the diff to a **read-only** local Cursor agent
-5. Fast-forwards **only the reviewed SHA** (no second fetch)
+This is a command-line tool, not an Omarchy bar plugin. Install it with pip, then use it instead of `omarchy plugin add` / `omarchy plugin update`.
+
+## How it works
+
+1. **Fetch** — `git fetch` only. The live tree under `~/.config/omarchy/plugins` stays untouched.
+2. **Scan** — snapshot `FETCH_HEAD` and look for Process/exec, network, credential paths, pipe-to-shell, new binaries. Compare capabilities to the previous commit and a stored baseline.
+3. **Agent** — a local Cursor agent sees the diff with read/grep/glob/ls only. No shell, no edits, no executing plugin code.
+4. **Human** — three outcomes:
+   - **ALLOW** — clean delta, agent agreed, no new capabilities. Confirm, or `--yes`.
+   - **NEEDS HUMAN** — new Process/network/binary, first install, or the agent is unsure. Prints **NEEDS HUMAN REVIEW** and the reasons, then asks accept or deny. `--yes` will not skip this; `--force` will.
+   - **DENY** — pipe-to-shell, credential-path hits, agent deny, or agent failure. Prints **DENIED — will not apply**. Never merges. `--force` does not override.
+5. **Merge** — fast-forward the reviewed SHA, then `omarchy plugin validate`. A later commit that landed on GitHub during the review is not pulled in.
 
 ## Install
 
 ```bash
-cd ~/Projects/omarchy-plugin-guard
+git clone https://github.com/yelenkovsky/omarchy-plugin-guard.git
+cd omarchy-plugin-guard
 python3 -m venv .venv
 .venv/bin/pip install -e .
 ln -sf "$PWD/.venv/bin/omarchy-plugin-guard" ~/.local/bin/omarchy-plugin-guard
 ```
 
-Export a Cursor user API key (Dashboard → Integrations):
+Requires Python 3.11+. Agent review needs a Cursor user API key ([Dashboard → Integrations](https://cursor.com/dashboard/integrations)):
 
 ```bash
 export CURSOR_API_KEY=cursor_...
+# optional; default is composer-2.5
+export CURSOR_MODEL=composer-2.5
 ```
 
-Optional: `CURSOR_MODEL` (default `composer-2.5`).
+Mechanical scan still runs with `--skip-agent` (that path always ends **needs-human**, never auto-applies).
 
 ## First run
 
-Trust the currently installed trees as the capability baseline:
+Record what is already installed, then stop using raw `omarchy plugin update`:
 
 ```bash
 omarchy-plugin-guard baseline --write
 omarchy-plugin-guard status
-```
-
-Then update through the guard instead of `omarchy plugin update`:
-
-```bash
 omarchy-plugin-guard update --dry-run
 omarchy-plugin-guard update
-omarchy-plugin-guard add https://github.com/acme/omarchy-weather.git
+omarchy-plugin-guard add https://github.com/example/omarchy-weather.git --enable
 ```
 
-## Verdicts
-
-| Combined verdict | `--yes` | `--force` |
-| --- | --- | --- |
-| `allow` (clean delta, agent allow, no new capabilities) | applies | applies |
-| `needs-human` (new Process/network/binary, origin change, no baseline, agent unsure) | skipped | applies |
-| `deny` (pipe-to-shell, credential paths, agent deny, agent failure) | refused | refused |
-
-`--skip-agent` never auto-applies; it still ends `needs-human`.
-
-On `needs-human`, the CLI prints **NEEDS HUMAN REVIEW** and the reasons (plus the agent summary) **before** the accept/deny prompt. Denies print **DENIED — will not apply** and never ask.
-
-State lives in `~/.config/omarchy/plugin-guard/` (`baselines/`, `reviews/`).
+`--yes` auto-confirms **allow** only. `--force` also applies **needs-human**. Nothing applies a **deny**.
 
 ## Commands
 
@@ -69,3 +64,9 @@ omarchy-plugin-guard add <git-url> [--enable] [--dry-run] [--force]
 ```
 
 Exit codes: `0` ok / up to date / applied, `1` hard error, `2` denied or skipped.
+
+State: `~/.config/omarchy/plugin-guard/` (`baselines/`, `reviews/`).
+
+## License
+
+MIT
