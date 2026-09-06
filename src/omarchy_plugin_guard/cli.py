@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import sys
@@ -226,8 +227,13 @@ def cmd_add(args: argparse.Namespace) -> int:
     return _emit([report], args.json)
 
 
+def _progress(message: str) -> None:
+    print(f"omarchy-plugin-guard: {message}", file=sys.stderr, flush=True)
+
+
 def _add_plugin(args: argparse.Namespace) -> PluginReport:
     url = args.url
+    _progress(f"checking git URL {url}")
     try:
         check_git_url(url)
     except ApplyError as exc:
@@ -236,11 +242,14 @@ def _add_plugin(args: argparse.Namespace) -> PluginReport:
     tmp = Path(tempfile.mkdtemp(prefix="omarchy-plugin-guard-add-"))
     clone_dir = tmp / "clone"
     try:
+        _progress("cloning (may take a while with no extra output)")
         clone(url, clone_dir)
+        _progress("validating manifest")
         validate_plugin(clone_dir)
         plugin_id = json.loads((clone_dir / "manifest.json").read_text(encoding="utf-8"))["id"]
         if not _valid_id(plugin_id):
             return PluginReport(id=str(plugin_id), status="error", error="invalid plugin id", origin=url)
+        _progress(f"plugin id is {plugin_id}")
         target = plugins_dir() / plugin_id
         if target.exists():
             return PluginReport(
@@ -249,11 +258,13 @@ def _add_plugin(args: argparse.Namespace) -> PluginReport:
                 error=f"already installed; update with: omarchy-plugin-guard update {plugin_id}",
                 origin=url,
             )
+        _progress("running mechanical scan")
         empty = Capabilities()
         findings, caps = scan_tree(clone_dir)
         expansion = capability_expansion(empty, caps)
         work = tmp / "review"
         _write_review_workspace(work, clone_dir, findings, caps, expansion, diff_text="(new install; full tree in snapshot/)")
+        _progress("mechanical scan finished")
         agent = _maybe_agent(
             work,
             plugin_id=plugin_id,
@@ -440,7 +451,13 @@ def _maybe_agent(
     skip_agent: bool,
 ) -> dict[str, Any] | None:
     if skip_agent:
+        _progress(f"skipping agent review of {plugin_id}")
         return None
+    model = os.environ.get("CURSOR_MODEL", "composer-2.5").strip() or "composer-2.5"
+    _progress(
+        f"starting agent review of {plugin_id} with {model}; "
+        "this often looks idle for 30–90s until the agent returns"
+    )
     scan_payload = {
         "findings": findings_to_dict(findings),
         "capabilities": caps.to_dict(),
@@ -458,7 +475,9 @@ def _maybe_agent(
             diff_text=diff_text,
         )
     except ReviewError as exc:
+        _progress(f"agent review failed: {exc}")
         return {"error": str(exc)}
+    _progress(f"agent finished: {review.verdict}")
     return {
         "verdict": review.verdict,
         "summary": review.summary,
