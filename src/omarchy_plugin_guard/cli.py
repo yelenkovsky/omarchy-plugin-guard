@@ -27,6 +27,7 @@ from omarchy_plugin_guard.gitops import (
     clone,
     diff,
     fetch_origin,
+    git,
     git_out,
     is_ancestor,
     is_git_plugin,
@@ -338,18 +339,15 @@ def _review_and_maybe_apply(
     try:
         origin = remote_url(path)
         old_sha = rev_parse(path, "HEAD")
-        dirty = git_out(path, "status", "--porcelain")
-        if dirty:
-            return PluginReport(
-                id=plugin_id,
-                status="error",
-                error="working tree has local changes; commit, stash, or reset before update",
-                origin=origin,
-                from_sha=old_sha,
-            )
         print(f"Fetching {plugin_id}...", file=sys.stderr, flush=True)
         fetch_origin(path)
         new_sha = rev_parse(path, "FETCH_HEAD")
+        dirty_text = git(path, "status", "--porcelain").stdout
+        incoming = []
+        if old_sha != new_sha:
+            incoming = git_out(
+                path, "log", "--oneline", "--no-decorate", f"{old_sha}..{new_sha}"
+            ).splitlines()
     except GitError as exc:
         return PluginReport(id=plugin_id, status="error", error=str(exc))
 
@@ -360,6 +358,25 @@ def _review_and_maybe_apply(
             from_sha=old_sha,
             to_sha=new_sha,
             origin=origin,
+        )
+
+    if dirty_text:
+        reasons = []
+        local_paths = _porcelain_paths(dirty_text)
+        if local_paths:
+            reasons.append("local: " + ", ".join(local_paths[:12]))
+        reasons.extend(f"incoming {line}" for line in incoming[:12])
+        return PluginReport(
+            id=plugin_id,
+            status="blocked",
+            error=(
+                "update available; not applied because the working tree has local changes "
+                "— stash, commit, or reset, then re-run update"
+            ),
+            origin=origin,
+            from_sha=old_sha,
+            to_sha=new_sha,
+            reasons=reasons or None,
         )
 
     stored = load_baseline(plugin_id)
@@ -626,7 +643,7 @@ def _emit(reports: list[PluginReport], as_json: bool) -> int:
             print("No git-managed plugins installed.")
         for item in reports:
             _print_report(item)
-    if any(item.status == "error" for item in reports):
+    if any(item.status in {"error", "blocked"} for item in reports):
         return 1
     if any(item.status in {"denied", "skipped"} or item.verdict == "deny" for item in reports):
         return 2
@@ -641,7 +658,8 @@ def _print_report(item: PluginReport) -> None:
         head += f" {item.from_sha[:8]} -> {item.to_sha[:8]}"
     print(head)
     if item.error:
-        print(f"  error: {item.error}")
+        prefix = "  error: " if item.status == "error" else "  "
+        print(f"{prefix}{item.error}")
     if item.reasons:
         for reason in item.reasons:
             print(f"  {reason}")
@@ -675,6 +693,18 @@ def _selected_plugins(ids: list[str]) -> list[Path]:
             raise ApplyError(f"plugin '{plugin_id}' is not installed")
         selected.append(path)
     return selected
+
+
+def _porcelain_paths(porcelain: str) -> list[str]:
+    paths: list[str] = []
+    for line in porcelain.splitlines():
+        if not line:
+            continue
+        if " -> " in line[3:]:
+            paths.append(line.split(" -> ", 1)[1])
+            continue
+        paths.append(line[3:] if len(line) > 3 else line.lstrip())
+    return paths
 
 
 def _valid_id(plugin_id: str) -> bool:
