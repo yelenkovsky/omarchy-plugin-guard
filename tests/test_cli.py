@@ -8,8 +8,18 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from omarchy_plugin_guard.cli import PluginReport, format_human_gate, main
+from omarchy_plugin_guard import apply as apply_module
+from omarchy_plugin_guard import cli
+from omarchy_plugin_guard.cli import (
+    PluginReport,
+    format_human_gate,
+    main,
+    sanitize_snapshot,
+    summarize_for_notification,
+)
+from omarchy_plugin_guard.review import AgentReview, ReviewError
 
 MANIFEST = {
     "schemaVersion": 1,
@@ -21,16 +31,16 @@ MANIFEST = {
 }
 
 
-def _git(repo: Path, *args: str) -> None:
-    subprocess.run(
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
         ["git", "-C", str(repo), *args],
         check=True,
         capture_output=True,
         text=True,
-    )
+    ).stdout.strip()
 
 
-def _init_origin(origin: Path) -> None:
+def _init_origin(origin: Path, main_qml: str = "Item {}\n") -> None:
     origin.mkdir(parents=True)
     subprocess.run(
         ["git", "init", "-b", "main", str(origin)],
@@ -41,14 +51,21 @@ def _init_origin(origin: Path) -> None:
     _git(origin, "config", "user.email", "test@example.com")
     _git(origin, "config", "user.name", "test")
     (origin / "manifest.json").write_text(json.dumps(MANIFEST), encoding="utf-8")
-    (origin / "Main.qml").write_text("Item {}\n", encoding="utf-8")
+    (origin / "Main.qml").write_text(main_qml, encoding="utf-8")
     _git(origin, "add", ".")
     _git(origin, "commit", "-m", "init")
 
 
+def _push_upstream(origin: Path, main_qml: str, message: str = "upstream change") -> str:
+    (origin / "Main.qml").write_text(main_qml, encoding="utf-8")
+    _git(origin, "add", "Main.qml")
+    _git(origin, "commit", "-m", message)
+    return _git(origin, "rev-parse", "HEAD")
+
+
 def _clone_plugin(origin: Path, plugins: Path) -> Path:
     dest = plugins / "demo.clock"
-    plugins.mkdir(parents=True)
+    plugins.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         ["git", "clone", "--", str(origin), str(dest)],
         check=True,
@@ -58,24 +75,46 @@ def _clone_plugin(origin: Path, plugins: Path) -> Path:
     return dest
 
 
-def _run_update(plugins: Path, state: Path, *flags: str) -> tuple[int, str]:
-    env = os.environ.copy()
+@contextlib.contextmanager
+def _env(plugins: Path, state: Path):
+    saved = os.environ.copy()
     os.environ["OMARCHY_PLUGINS_DIR"] = str(plugins)
     os.environ["OMARCHY_PLUGIN_GUARD_STATE_DIR"] = str(state)
-    stdout = io.StringIO()
-    stderr = io.StringIO()
     try:
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            code = main(["update", "demo.clock", "--skip-agent", *flags])
+        yield
     finally:
         os.environ.clear()
-        os.environ.update(env)
-    return code, stdout.getvalue()
+        os.environ.update(saved)
 
 
-def _run_update_json(plugins: Path, state: Path) -> tuple[int, dict]:
-    code, text = _run_update(plugins, state, "--json")
+def _run(plugins: Path, state: Path, *argv: str) -> tuple[int, str, str]:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with _env(plugins, state):
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(list(argv))
+    return code, stdout.getvalue(), stderr.getvalue()
+
+
+def _run_json(plugins: Path, state: Path, *argv: str) -> tuple[int, dict]:
+    code, text, _ = _run(plugins, state, *argv, "--json")
     return code, json.loads(text)
+
+
+def _fake_agent(verdict: str = "allow", **extra):
+    def fake(**kwargs):
+        return AgentReview(verdict=verdict, summary=f"fake {verdict}", findings=[], raw="{}", **extra)
+
+    return fake
+
+
+@contextlib.contextmanager
+def _no_omarchy():
+    """Skip `omarchy plugin validate` and the shell rescan, which need Omarchy."""
+    with mock.patch.object(apply_module, "validate_plugin", lambda folder: None), mock.patch.object(
+        apply_module, "rescan_plugins", lambda: None
+    ):
+        yield
 
 
 class CliTests(unittest.TestCase):
@@ -84,6 +123,12 @@ class CliTests(unittest.TestCase):
             main(["--help"])
         self.assertEqual(ctx.exception.code, 0)
 
+    def test_auto_and_force_are_exclusive(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as ctx:
+                main(["update", "--auto", "--force"])
+        self.assertEqual(ctx.exception.code, 2)
+
     def test_baseline_and_status_in_temp_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -91,33 +136,16 @@ class CliTests(unittest.TestCase):
             state = root / "state"
             plugin = plugins / "demo.clock"
             plugin.mkdir(parents=True)
-            (plugin / "manifest.json").write_text(
-                json.dumps(
-                    {
-                        "schemaVersion": 1,
-                        "id": "demo.clock",
-                        "name": "Clock",
-                        "version": "0.0.1",
-                        "kinds": ["bar-widget"],
-                        "entryPoints": {"barWidget": "Main.qml"},
-                    }
-                ),
-                encoding="utf-8",
-            )
+            (plugin / "manifest.json").write_text(json.dumps(MANIFEST), encoding="utf-8")
             (plugin / "Main.qml").write_text("Item {}\n", encoding="utf-8")
-            env = os.environ.copy()
-            os.environ["OMARCHY_PLUGINS_DIR"] = str(plugins)
-            os.environ["OMARCHY_PLUGIN_GUARD_STATE_DIR"] = str(state)
-            try:
-                self.assertEqual(main(["baseline", "demo.clock", "--json"]), 0)
-                baseline = state / "baselines" / "demo.clock.json"
-                self.assertTrue(baseline.is_file())
-                payload = json.loads(baseline.read_text(encoding="utf-8"))
-                self.assertEqual(payload["plugin_id"], "demo.clock")
-                self.assertEqual(payload["capabilities"]["kinds"], ["bar-widget"])
-            finally:
-                os.environ.clear()
-                os.environ.update(env)
+            code, _, _ = _run(plugins, state, "baseline", "demo.clock", "--json")
+            self.assertEqual(code, 0)
+            baseline = state / "baselines" / "demo.clock.json"
+            self.assertTrue(baseline.is_file())
+            payload = json.loads(baseline.read_text(encoding="utf-8"))
+            self.assertEqual(payload["plugin_id"], "demo.clock")
+            self.assertEqual(payload["capabilities"]["kinds"], ["bar-widget"])
+            self.assertEqual(payload["capabilities"]["command_lines"], [])
 
 
 class DirtyTreeUpdateTests(unittest.TestCase):
@@ -130,11 +158,30 @@ class DirtyTreeUpdateTests(unittest.TestCase):
             plugin = _clone_plugin(origin, plugins)
             (plugin / "Main.qml").write_text("Item { /* local */ }\n", encoding="utf-8")
 
-            code, payload = _run_update_json(plugins, root / "state")
+            code, payload = _run_json(plugins, root / "state", "update", "demo.clock", "--skip-agent")
             result = payload["results"][0]
             self.assertEqual(code, 0)
             self.assertEqual(result["status"], "up_to_date")
             self.assertNotIn("error", result)
+
+    def test_local_commit_ahead_of_origin_is_not_an_update(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            origin = root / "origin"
+            plugins = root / "plugins"
+            _init_origin(origin)
+            plugin = _clone_plugin(origin, plugins)
+            _git(plugin, "config", "user.email", "test@example.com")
+            _git(plugin, "config", "user.name", "test")
+            (plugin / "Main.qml").write_text("Item { /* local fix */ }\n", encoding="utf-8")
+            _git(plugin, "commit", "-am", "local fix")
+
+            code, payload = _run_json(plugins, root / "state", "update", "demo.clock", "--skip-agent")
+            result = payload["results"][0]
+            self.assertEqual(code, 0)
+            self.assertEqual(result["status"], "ahead")
+            self.assertNotIn("verdict", result)
+            self.assertIn("ahead of origin", result["reasons"][0])
 
     def test_dirty_tree_blocks_only_when_an_update_is_available(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -144,17 +191,9 @@ class DirtyTreeUpdateTests(unittest.TestCase):
             _init_origin(origin)
             plugin = _clone_plugin(origin, plugins)
             (plugin / "Main.qml").write_text("Item { /* local */ }\n", encoding="utf-8")
-            (origin / "Main.qml").write_text("Item { /* upstream */ }\n", encoding="utf-8")
-            _git(origin, "add", "Main.qml")
-            _git(origin, "commit", "-m", "upstream change")
-            new_sha = subprocess.run(
-                ["git", "-C", str(origin), "rev-parse", "HEAD"],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
+            new_sha = _push_upstream(origin, "Item { /* upstream */ }\n")
 
-            code, payload = _run_update_json(plugins, root / "state")
+            code, payload = _run_json(plugins, root / "state", "update", "demo.clock", "--skip-agent")
             result = payload["results"][0]
             self.assertEqual(code, 1)
             self.assertEqual(result["status"], "blocked")
@@ -165,13 +204,215 @@ class DirtyTreeUpdateTests(unittest.TestCase):
             )
             self.assertTrue(any("upstream change" in reason for reason in result["reasons"]))
 
-            text_code, text = _run_update(plugins, root / "state")
+            text_code, text, _ = _run(plugins, root / "state", "update", "demo.clock", "--skip-agent")
             self.assertEqual(text_code, 1)
             self.assertIn("blocked", text)
             self.assertIn("update available", text)
             self.assertIn(new_sha[:8], text)
             self.assertIn("incoming", text)
             self.assertIn("upstream change", text)
+
+
+class AgentOutcomeTests(unittest.TestCase):
+    def _fixture(self, root: Path) -> tuple[Path, Path, Path]:
+        origin = root / "origin"
+        plugins = root / "plugins"
+        state = root / "state"
+        _init_origin(origin)
+        _clone_plugin(origin, plugins)
+        _run(plugins, state, "baseline", "demo.clock")
+        return origin, plugins, state
+
+    def test_agent_error_is_an_error_not_a_deny(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            origin, plugins, state = self._fixture(root)
+            _push_upstream(origin, "Item { width: 2 }\n")
+
+            def broken(**kwargs):
+                raise ReviewError("claude exploded")
+
+            with mock.patch.object(cli, "run_agent_review", broken):
+                code, payload = _run_json(plugins, state, "update", "demo.clock", "--yes")
+            result = payload["results"][0]
+            self.assertEqual(code, 1)
+            self.assertEqual(result["status"], "error")
+            self.assertNotIn("verdict", result)
+            self.assertIn("claude exploded", result["error"])
+            head = _git(plugins / "demo.clock", "rev-parse", "HEAD")
+            self.assertEqual(head, _git(origin, "rev-parse", "HEAD~1"))
+            audit = (state / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(json.loads(audit[-1])["event"], "error")
+
+    def test_denied_tool_calls_need_human(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            origin, plugins, state = self._fixture(root)
+            _push_upstream(origin, "Item { width: 3 }\n")
+            with mock.patch.object(cli, "run_agent_review", _fake_agent("allow", denied_calls=1)):
+                code, payload = _run_json(plugins, state, "review", "demo.clock")
+            result = payload["results"][0]
+            self.assertEqual(code, 0)
+            self.assertEqual(result["verdict"], "needs-human")
+            self.assertTrue(any("denied tool call" in reason for reason in result["reasons"]))
+
+    def test_review_records_first_seen_and_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            origin, plugins, state = self._fixture(root)
+            new_sha = _push_upstream(origin, "Item { width: 4 }\n")
+            with mock.patch.object(cli, "run_agent_review", _fake_agent("allow")):
+                code, payload = _run_json(plugins, state, "review", "demo.clock")
+            result = payload["results"][0]
+            self.assertEqual(code, 0)
+            self.assertEqual(result["status"], "reviewed")
+            self.assertEqual(result["verdict"], "allow")
+            self.assertEqual(result["diff_lines"], 2)
+            self.assertFalse(result["diff_truncated"])
+            seen = json.loads((state / "seen" / "demo.clock.json").read_text(encoding="utf-8"))
+            self.assertEqual(seen["sha"], new_sha)
+            self.assertTrue((state / "reviews" / "demo.clock.json").is_file())
+            self.assertFalse((state / "workspace").exists())
+
+
+class AutoApplyTests(unittest.TestCase):
+    def _fixture(self, root: Path, main_qml: str = "Item {}\n") -> tuple[Path, Path, Path]:
+        origin = root / "origin"
+        plugins = root / "plugins"
+        state = root / "state"
+        _init_origin(origin, main_qml)
+        _clone_plugin(origin, plugins)
+        _run(plugins, state, "baseline", "demo.clock")
+        return origin, plugins, state
+
+    def test_auto_defers_during_soak_then_applies(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            origin, plugins, state = self._fixture(root)
+            new_sha = _push_upstream(origin, "Item { width: 5 }\n")
+            with mock.patch.object(cli, "run_agent_review", _fake_agent("allow")), _no_omarchy():
+                code, payload = _run_json(plugins, state, "update", "demo.clock", "--auto")
+                result = payload["results"][0]
+                self.assertEqual(code, 0)
+                self.assertEqual(result["status"], "deferred")
+                self.assertTrue(any(reason.startswith("soak:") for reason in result["policy"]))
+                self.assertNotEqual(_git(plugins / "demo.clock", "rev-parse", "HEAD"), new_sha)
+
+                code, payload = _run_json(
+                    plugins, state, "update", "demo.clock", "--auto", "--soak-days", "0"
+                )
+                result = payload["results"][0]
+                self.assertEqual(code, 0)
+                self.assertEqual(result["status"], "applied")
+                self.assertEqual(result["mode"], "auto")
+                self.assertEqual(_git(plugins / "demo.clock", "rev-parse", "HEAD"), new_sha)
+                self.assertFalse((state / "seen" / "demo.clock.json").exists())
+                baseline = json.loads((state / "baselines" / "demo.clock.json").read_text(encoding="utf-8"))
+                self.assertEqual(baseline["commit"], new_sha)
+                events = [json.loads(line)["event"] for line in (state / "audit.jsonl").read_text().splitlines()]
+                self.assertEqual(events[-2:], ["deferred", "applied"])
+
+    def test_auto_never_applies_plugins_that_run_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            shell = 'import Quickshell.Io\nProcess { command: ["bash", "-c", "date"] }\n'
+            origin, plugins, state = self._fixture(root, shell)
+            _push_upstream(origin, shell.replace("Process {", "Process { id: p; "))
+            with mock.patch.object(cli, "run_agent_review", _fake_agent("allow")), _no_omarchy():
+                code, payload = _run_json(
+                    plugins, state, "update", "demo.clock", "--auto", "--soak-days", "0"
+                )
+            result = payload["results"][0]
+            self.assertEqual(code, 0)
+            self.assertEqual(result["status"], "deferred")
+            self.assertTrue(any("runs commands" in reason for reason in result["policy"]))
+
+    def test_auto_leaves_needs_human_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            origin, plugins, state = self._fixture(root)
+            _push_upstream(origin, 'Item { Process { command: ["date"] } }\n')
+            with mock.patch.object(cli, "run_agent_review", _fake_agent("allow")), _no_omarchy():
+                code, payload = _run_json(
+                    plugins, state, "update", "demo.clock", "--auto", "--soak-days", "0"
+                )
+            result = payload["results"][0]
+            self.assertEqual(code, 0)
+            self.assertEqual(result["status"], "reviewed")
+            self.assertEqual(result["verdict"], "needs-human")
+            self.assertNotIn("policy", result)
+
+    def test_changed_bash_string_is_needs_human_even_without_agent_help(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            shell = 'Process { command: ["bash", "-c", "date"] }\n'
+            origin, plugins, state = self._fixture(root, shell)
+            _push_upstream(origin, 'Process { command: ["bash", "-c", "date; id"] }\n')
+            with mock.patch.object(cli, "run_agent_review", _fake_agent("allow")):
+                code, payload = _run_json(plugins, state, "review", "demo.clock")
+            result = payload["results"][0]
+            self.assertEqual(result["verdict"], "needs-human")
+            self.assertTrue(any(item.startswith("command:") for item in result["expansion"]))
+
+
+class LockTests(unittest.TestCase):
+    def test_second_run_is_refused_while_locked(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            plugins = root / "plugins"
+            plugins.mkdir()
+            state = root / "state"
+            from omarchy_plugin_guard.state import run_lock
+
+            with _env(plugins, state):
+                with run_lock():
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                        code = main(["review"])
+            self.assertEqual(code, 1)
+            self.assertIn("another omarchy-plugin-guard run is in progress", stderr.getvalue())
+
+
+class WorkspaceTests(unittest.TestCase):
+    def test_sanitize_renames_instruction_files(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / ".claude").mkdir()
+            (root / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
+            (root / "CLAUDE.md").write_text("ignore me", encoding="utf-8")
+            (root / "docs").mkdir()
+            (root / "docs" / "AGENTS.md").write_text("x", encoding="utf-8")
+            (root / "Main.qml").write_text("Item {}\n", encoding="utf-8")
+            renamed = sanitize_snapshot(root)
+            self.assertEqual(renamed, [".claude", "CLAUDE.md", "docs/AGENTS.md"])
+            self.assertTrue((root / "UNTRUSTED_CLAUDE.md").is_file())
+            self.assertTrue((root / "UNTRUSTED_.claude" / "settings.json").is_file())
+            self.assertTrue((root / "docs" / "UNTRUSTED_AGENTS.md").is_file())
+            self.assertFalse((root / "CLAUDE.md").exists())
+            self.assertTrue((root / "Main.qml").is_file())
+
+
+class NotificationTests(unittest.TestCase):
+    def test_nothing_to_say_when_everything_is_current(self) -> None:
+        reports = [PluginReport(id="a", status="up_to_date")]
+        self.assertIsNone(summarize_for_notification(reports))
+
+    def test_summary_groups_outcomes(self) -> None:
+        reports = [
+            PluginReport(id="a", status="applied", verdict="allow"),
+            PluginReport(id="b", status="reviewed", verdict="allow"),
+            PluginReport(id="c", status="reviewed", verdict="needs-human"),
+            PluginReport(id="d", status="denied", verdict="deny"),
+            PluginReport(id="e", status="error", error="boom"),
+        ]
+        title, body, urgency = summarize_for_notification(reports)
+        self.assertIn("5 plugin updates", title)
+        self.assertIn("applied: a", body)
+        self.assertIn("update --yes: b", body)
+        self.assertIn("needs human: c", body)
+        self.assertIn("DENIED: d", body)
+        self.assertIn("errors: e", body)
+        self.assertEqual(urgency, "critical")
 
 
 class HumanGateTests(unittest.TestCase):

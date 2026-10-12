@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omarchy-plugin-guard"
-version = "0.1.0"
+version = "0.2.0"
 description = "Review Omarchy shell plugin updates before they merge into ~/.config/omarchy/plugins"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "xbloc" }]
-dependencies = ["cursor-sdk"]
+dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest"]

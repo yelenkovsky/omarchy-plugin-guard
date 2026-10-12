@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import stat
@@ -57,11 +58,13 @@ HARMLESS_NAMES = {
     ".gitignore",
 }
 
-COMMAND_ASSIGN = re.compile(
-    r"""(?:\.command|command)\s*=\s*\[([^\]]{0,800})\]""",
-    re.MULTILINE,
-)
-QUOTED = re.compile(r"""(['"])(.*?)\1""")
+# Matches both the QML binding form `command: [...]` and the imperative
+# `proc.command = [...]`. The array body is extracted by _extract_array so
+# that brackets inside shell strings (`[[ -f "$f" ]]`) do not cut it short.
+COMMAND_START = re.compile(r"(?<![A-Za-z0-9_])command\s*[:=]\s*\[")
+QUOTED = re.compile(r"""(['"])((?:\\.|(?!\1).)*)\1""", re.DOTALL)
+COMMAND_SCAN_LIMIT = 4000
+COMMAND_LABEL_LIMIT = 96
 
 CONTENT_RULES: list[tuple[str, str, re.Pattern[str]]] = [
     (
@@ -83,9 +86,27 @@ CONTENT_RULES: list[tuple[str, str, re.Pattern[str]]] = [
             r"|password-store"
             r"|/\.netrc\b"
             r"|id_rsa\b"
-            r"|CURSOR_API_KEY"
             r"|GNUPGHOME",
             re.IGNORECASE,
+        ),
+    ),
+    (
+        # Tokens and credential stores for tools that run on this machine. A
+        # NOTE, not a BLOCK: a usage-meter plugin may read these legitimately,
+        # but a *new* reference is a capability expansion that needs a human.
+        "credential_stores",
+        NOTE,
+        re.compile(
+            r"\.claude/\.credentials"
+            r"|proton-pass-agent"
+            r"|ANTHROPIC_API_KEY"
+            r"|CLAUDE_CODE_OAUTH_TOKEN"
+            r"|CURSOR_API_KEY"
+            r"|\.config/gh/hosts\.yml"
+            r"|\.aws/credentials"
+            r"|\.kube/config"
+            r"|\.docker/config\.json"
+            r"|\bsecret-tool\b",
         ),
     ),
     (
@@ -97,11 +118,6 @@ CONTENT_RULES: list[tuple[str, str, re.Pattern[str]]] = [
         "process",
         NOTE,
         re.compile(r"\bProcess\s*\{|\bQuickshell\.Io\b"),
-    ),
-    (
-        "process",
-        NOTE,
-        re.compile(r"""(?:\.command|command)\s*=\s*\["""),
     ),
     (
         "privileged",
@@ -137,19 +153,39 @@ class Capabilities:
     flags: dict[str, bool] = field(default_factory=dict)
     process_binaries: list[str] = field(default_factory=list)
     unexpected_files: list[str] = field(default_factory=list)
+    # One signature per full `command: [...]` array. None means the baseline
+    # predates signatures (old on-disk format) and cannot vouch for commands.
+    command_lines: list[str] | None = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Capabilities:
+        raw_commands = data.get("command_lines")
         return cls(
             kinds=list(data.get("kinds") or []),
             manifest_version=str(data.get("manifest_version") or ""),
             flags=dict(data.get("flags") or {}),
             process_binaries=list(data.get("process_binaries") or []),
             unexpected_files=list(data.get("unexpected_files") or []),
+            command_lines=None if raw_commands is None else list(raw_commands),
         )
+
+    def runs_code(self) -> bool:
+        """True when the tree can execute anything beyond declarative QML."""
+        risky = (
+            "process",
+            "network",
+            "helper_scripts",
+            "native_source",
+            "native_binaries",
+            "privileged",
+            "eval_dynamic",
+            "pipe_to_shell",
+            "sudoers",
+        )
+        return any(self.flags.get(name, False) for name in risky)
 
 
 def empty_flags() -> dict[str, bool]:
@@ -158,6 +194,7 @@ def empty_flags() -> dict[str, bool]:
         "network": False,
         "filesystem": False,
         "credentials": False,
+        "credential_stores": False,
         "privileged": False,
         "helper_scripts": False,
         "native_source": False,
@@ -172,6 +209,7 @@ def scan_tree(root: Path) -> tuple[list[Finding], Capabilities]:
     findings: list[Finding] = []
     flags = empty_flags()
     binaries: set[str] = set()
+    commands: set[str] = set()
     unexpected: list[str] = []
     kinds: list[str] = []
     manifest_version = ""
@@ -248,9 +286,10 @@ def scan_tree(root: Path) -> tuple[list[Finding], Capabilities]:
                 if rule in flags:
                     flags[rule] = True
 
-        for match in COMMAND_ASSIGN.finditer(text):
+        for inner in iter_command_arrays(text):
             flags["process"] = True
-            for token in _command_tokens(match.group(1)):
+            commands.add(command_signature(inner))
+            for token in _command_tokens(inner):
                 binaries.add(token)
 
     caps = Capabilities(
@@ -259,8 +298,54 @@ def scan_tree(root: Path) -> tuple[list[Finding], Capabilities]:
         flags=flags,
         process_binaries=sorted(binaries),
         unexpected_files=sorted(set(unexpected)),
+        command_lines=sorted(commands),
     )
     return findings, caps
+
+
+def iter_command_arrays(text: str) -> Iterable[str]:
+    """Yield the body of every `command: [...]` / `command = [...]` array."""
+    for match in COMMAND_START.finditer(text):
+        yield _extract_array(text, match.end())
+
+
+def _extract_array(text: str, start: int, limit: int = COMMAND_SCAN_LIMIT) -> str:
+    depth = 1
+    quote: str | None = None
+    i = start
+    end = min(len(text), start + limit)
+    while i < end:
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'`":
+            quote = ch
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return text[start:i]
+        i += 1
+    # Unterminated or over the limit: keep what we saw so a change still
+    # changes the signature.
+    return text[start:end] + " [unterminated]"
+
+
+def command_signature(inner: str) -> str:
+    """Stable, human-readable identity for one command array.
+
+    The label is for humans reading baselines and reports; the digest makes
+    the comparison exact even when the label is clipped.
+    """
+    compact = " ".join(inner.split())
+    digest = hashlib.sha256(compact.encode("utf-8")).hexdigest()[:12]
+    label = compact if len(compact) <= COMMAND_LABEL_LIMIT else compact[: COMMAND_LABEL_LIMIT - 1] + "…"
+    return f"{label} #{digest}"
 
 
 def capability_expansion(old: Capabilities, new: Capabilities) -> list[str]:
@@ -276,6 +361,15 @@ def capability_expansion(old: Capabilities, new: Capabilities) -> list[str]:
     for binary in new.process_binaries:
         if binary not in old_bins:
             changes.append(f"process:{binary}")
+    new_commands = list(new.command_lines or [])
+    if old.command_lines is None:
+        if new_commands:
+            changes.append("baseline:no command signatures recorded (re-run baseline --write)")
+    else:
+        old_commands = set(old.command_lines)
+        for signature in new_commands:
+            if signature not in old_commands:
+                changes.append(f"command:{signature}")
     return changes
 
 

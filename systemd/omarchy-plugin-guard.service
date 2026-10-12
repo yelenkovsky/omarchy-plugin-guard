@@ -1,0 +1,20 @@
+[Unit]
+Description=Review Omarchy plugin updates with omarchy-plugin-guard
+
+[Service]
+Type=oneshot
+# Default mode: fetch, review, notify. Nothing merges.
+# To auto-apply declarative-only updates after the soak delay, create
+#   ~/.config/omarchy/plugin-guard/timer.env
+# containing:
+#   OMARCHY_PLUGIN_GUARD_ARGS="update --auto --notify"
+Environment="OMARCHY_PLUGIN_GUARD_ARGS=review --notify"
+EnvironmentFile=-%h/.config/omarchy/plugin-guard/timer.env
+Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/omarchy-plugin-guard $OMARCHY_PLUGIN_GUARD_ARGS
+# Exit 2 means "a plugin was denied or skipped": a finding, not a failure of
+# the tool. The notification carries it. Exit 1 (git or agent error) still
+# marks the unit failed so it shows up in `systemctl --user --failed`.
+SuccessExitStatus=2
+TimeoutStartSec=45min
+Nice=10

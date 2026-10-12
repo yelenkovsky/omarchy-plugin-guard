@@ -86,7 +86,13 @@ def is_ancestor(repo: Path, older: str, newer: str) -> bool:
 
 
 def diff(repo: Path, old: str, new: str) -> str:
-    result = git(repo, "diff", "--find-renames", f"{old}...{new}", check=True)
+    """Tree-to-tree diff: exactly what changes on disk if `old` becomes `new`.
+
+    Deliberately not the three-dot form. That diffs from the merge base, which
+    is empty or misleading when upstream rewound or rewrote history, and the
+    reviewer must see the real content change in those cases most of all.
+    """
+    result = git(repo, "diff", "--find-renames", old, new, check=True)
     return result.stdout
 
 

@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from dataclasses import asdict, dataclass
@@ -37,7 +38,8 @@ from omarchy_plugin_guard.gitops import (
     snapshot,
 )
 from omarchy_plugin_guard.paths import plugins_dir, reviews_dir, state_dir
-from omarchy_plugin_guard.review import ReviewError, run_agent_review
+from omarchy_plugin_guard.policy import AutoPolicy, count_diff_lines, evaluate_auto_apply
+from omarchy_plugin_guard.review import ReviewError, default_model, run_agent_review
 from omarchy_plugin_guard.scan import (
     Capabilities,
     capability_expansion,
@@ -45,17 +47,42 @@ from omarchy_plugin_guard.scan import (
     has_block_findings,
     scan_tree,
 )
+from omarchy_plugin_guard.state import (
+    LockHeld,
+    append_audit,
+    clear_first_seen,
+    note_first_seen,
+    now_utc,
+    run_lock,
+)
 from omarchy_plugin_guard.verdict import combine_verdict
 
 PLUGIN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 DIFF_LIMIT = 80_000
 
+# Files and directories that an agent harness might treat as instructions.
+# They are renamed inside the review snapshot so they stay plain data.
+UNTRUSTED_INSTRUCTION_NAMES = {
+    "CLAUDE.md",
+    "CLAUDE.local.md",
+    "AGENTS.md",
+    ".cursorrules",
+    ".mcp.json",
+    ".claude",
+    ".cursor",
+    ".codex",
+}
+UNTRUSTED_PREFIX = "UNTRUSTED_"
+
+LOCKED_COMMANDS = {"baseline", "review", "update", "add"}
+
 EPILOG = """Examples:
   omarchy-plugin-guard status
   omarchy-plugin-guard baseline --write
-  omarchy-plugin-guard review --dry-run
+  omarchy-plugin-guard review --notify
   omarchy-plugin-guard update
   omarchy-plugin-guard update stappmus.activity-monitor
+  omarchy-plugin-guard update --auto --notify
   omarchy-plugin-guard add https://github.com/acme/omarchy-weather.git
   omarchy-plugin-guard update --json --dry-run
 """
@@ -74,6 +101,11 @@ class PluginReport:
     findings: list[dict[str, Any]] | None = None
     agent: dict[str, Any] | None = None
     error: str | None = None
+    diff_lines: int | None = None
+    diff_truncated: bool | None = None
+    policy: list[str] | None = None
+    first_seen_at: str | None = None
+    mode: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}
@@ -116,6 +148,26 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Apply a needs-human verdict without prompting (never overrides deny)",
     )
+    update.add_argument(
+        "--auto",
+        action="store_true",
+        help=(
+            "Unattended mode: apply an allow verdict only when the auto policy passes "
+            "(soak delay, diff size cap, declarative-only plugin). Never prompts."
+        ),
+    )
+    update.add_argument(
+        "--soak-days",
+        type=int,
+        default=None,
+        help="With --auto: days a SHA must have been visible before it may auto-apply (default 3)",
+    )
+    update.add_argument(
+        "--max-diff-lines",
+        type=int,
+        default=None,
+        help="With --auto: largest diff that may auto-apply, in changed lines (default 400)",
+    )
     update.set_defaults(func=cmd_update)
 
     add = sub.add_parser("add", help="Clone, review, then install a plugin from git")
@@ -126,11 +178,20 @@ def main(argv: list[str] | None = None) -> int:
     add.add_argument("--json", action="store_true")
     add.add_argument("--yes", "-y", action="store_true")
     add.add_argument("--force", action="store_true")
+    add.add_argument("--model", default=None, help="Claude model alias or id for the agent review")
     add.set_defaults(func=cmd_add)
 
     args = parser.parse_args(argv)
+    if getattr(args, "auto", False) and getattr(args, "force", False):
+        parser.error("--auto and --force cannot be combined")
     try:
+        if args.cmd in LOCKED_COMMANDS:
+            with run_lock():
+                return args.func(args)
         return args.func(args)
+    except LockHeld as exc:
+        print(f"omarchy-plugin-guard: {exc}", file=sys.stderr)
+        return 1
     except (GitError, ApplyError, ReviewError) as exc:
         print(f"omarchy-plugin-guard: {exc}", file=sys.stderr)
         return 1
@@ -141,6 +202,12 @@ def _add_review_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--skip-agent", action="store_true", help="Mechanical gates only")
     parser.add_argument("--dry-run", action="store_true", help="Review only; do not merge")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--notify",
+        action="store_true",
+        help="Send a desktop notification (notify-send) summarising the run",
+    )
+    parser.add_argument("--model", default=None, help="Claude model alias or id for the agent review")
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -161,6 +228,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "head": head,
                 "baseline_commit": stored.commit if stored else None,
                 "baseline_origin": stored.origin if stored else None,
+                "baseline_has_commands": (
+                    None if stored is None else stored.capabilities.command_lines is not None
+                ),
             }
         )
     if args.json:
@@ -173,7 +243,12 @@ def cmd_status(args: argparse.Namespace) -> int:
             if row.get("error"):
                 print(f"{row['id']}: error: {row['error']}")
                 continue
-            mark = "baseline" if row["baseline_commit"] else "no-baseline"
+            if not row["baseline_commit"]:
+                mark = "no-baseline"
+            elif row["baseline_has_commands"] is False:
+                mark = "baseline: old format, re-run baseline --write"
+            else:
+                mark = "baseline"
             print(f"{row['id']}: {row['head'][:12]} {row['origin'] or '(no origin)'} [{mark}]")
     return 0
 
@@ -204,11 +279,18 @@ def cmd_baseline(args: argparse.Namespace) -> int:
 def cmd_review(args: argparse.Namespace) -> int:
     args.yes = False
     args.force = False
+    args.auto = False
     args.dry_run = True
     return cmd_update(args)
 
 
 def cmd_update(args: argparse.Namespace) -> int:
+    policy: AutoPolicy | None = None
+    if getattr(args, "auto", False):
+        policy = AutoPolicy.from_env(
+            soak_days=getattr(args, "soak_days", None),
+            max_diff_lines=getattr(args, "max_diff_lines", None),
+        )
     reports: list[PluginReport] = []
     for path in _selected_plugins(args.ids):
         reports.append(
@@ -216,11 +298,16 @@ def cmd_update(args: argparse.Namespace) -> int:
                 path,
                 skip_agent=args.skip_agent,
                 dry_run=args.dry_run,
-                assume_yes=args.yes,
-                force=args.force,
+                assume_yes=getattr(args, "yes", False),
+                force=getattr(args, "force", False),
+                policy=policy,
+                model=getattr(args, "model", None),
             )
         )
-    return _emit(reports, args.json)
+    code = _emit(reports, args.json)
+    if getattr(args, "notify", False):
+        _notify(reports)
+    return code
 
 
 def cmd_add(args: argparse.Namespace) -> int:
@@ -263,21 +350,45 @@ def _add_plugin(args: argparse.Namespace) -> PluginReport:
         empty = Capabilities()
         findings, caps = scan_tree(clone_dir)
         expansion = capability_expansion(empty, caps)
-        work = tmp / "review"
-        _write_review_workspace(work, clone_dir, findings, caps, expansion, diff_text="(new install; full tree in snapshot/)")
-        _progress("mechanical scan finished")
-        agent = _maybe_agent(
-            work,
-            plugin_id=plugin_id,
+        new_sha = rev_parse(clone_dir, "HEAD")
+        work = _review_workspace()
+        try:
+            _write_review_workspace(
+                work, clone_dir, findings, caps, expansion, diff_text="(new install; full tree in snapshot/)"
+            )
+            _progress("mechanical scan finished")
+            agent = _maybe_agent(
+                work,
+                plugin_id=plugin_id,
+                origin=url,
+                old_sha="(none)",
+                new_sha=new_sha,
+                expansion=expansion,
+                findings=findings,
+                caps=caps,
+                diff_text="(new install)",
+                skip_agent=args.skip_agent,
+                model=getattr(args, "model", None),
+            )
+        finally:
+            _discard_workspace(work)
+        report = PluginReport(
+            id=plugin_id,
+            status="reviewed",
+            verdict=None,
+            from_sha="",
+            to_sha=new_sha,
             origin=url,
-            old_sha="(none)",
-            new_sha=rev_parse(clone_dir, "HEAD"),
             expansion=expansion,
-            findings=findings,
-            caps=caps,
-            diff_text="(new install)",
-            skip_agent=args.skip_agent,
+            findings=findings_to_dict(findings),
+            agent=agent,
+            mode="dry-run" if args.dry_run else "manual",
         )
+        if agent and agent.get("error"):
+            report.status = "error"
+            report.error = f"agent review failed: {agent['error']}"
+            _audit(report)
+            return report
         blocked = has_block_findings(findings)
         combined = combine_verdict(
             blocked=blocked,
@@ -285,30 +396,22 @@ def _add_plugin(args: argparse.Namespace) -> PluginReport:
             origin_changed=False,
             history_rewritten=False,
             has_baseline=False,
-            agent_verdict=None if agent is None or agent.get("error") else agent.get("verdict"),
-            agent_error=None if agent is None else agent.get("error"),
+            agent_verdict=None if agent is None else agent.get("verdict"),
+            agent_denied_calls=0 if agent is None else int(agent.get("denied_calls") or 0),
         )
-        report = PluginReport(
-            id=plugin_id,
-            status="reviewed",
-            verdict=combined.verdict,
-            from_sha="",
-            to_sha=rev_parse(clone_dir, "HEAD"),
-            origin=url,
-            expansion=expansion,
-            reasons=combined.reasons,
-            findings=findings_to_dict(findings),
-            agent=agent,
-        )
+        report.verdict = combined.verdict
+        report.reasons = combined.reasons
         if args.dry_run:
-            report.status = "reviewed"
+            _audit(report)
             return report
         if combined.verdict == "deny":
             _print_human_gate(report, action="install")
             report.status = "denied"
+            _audit(report)
             return report
         if not _should_apply(report, assume_yes=args.yes, force=args.force, action="install"):
             report.status = "skipped"
+            _audit(report)
             return report
         install_reviewed_clone(clone_dir, target)
         save_baseline(plugin_id, url, report.to_sha, caps)
@@ -318,6 +421,7 @@ def _add_plugin(args: argparse.Namespace) -> PluginReport:
                 enable_plugin(plugin_id)
             except ApplyError as exc:
                 report.error = f"installed but enable failed: {exc}"
+        _audit(report)
         return report
     except (GitError, ApplyError, OSError, json.JSONDecodeError, KeyError) as exc:
         return PluginReport(id="", status="error", error=str(exc), origin=url)
@@ -332,10 +436,13 @@ def _review_and_maybe_apply(
     dry_run: bool,
     assume_yes: bool,
     force: bool,
+    policy: AutoPolicy | None = None,
+    model: str | None = None,
 ) -> PluginReport:
     plugin_id = path.name
     if not is_git_plugin(path):
         return PluginReport(id=plugin_id, status="error", error="not a git checkout")
+    mode = "dry-run" if dry_run else ("auto" if policy is not None else "manual")
     try:
         origin = remote_url(path)
         old_sha = rev_parse(path, "HEAD")
@@ -349,15 +456,31 @@ def _review_and_maybe_apply(
                 path, "log", "--oneline", "--no-decorate", f"{old_sha}..{new_sha}"
             ).splitlines()
     except GitError as exc:
-        return PluginReport(id=plugin_id, status="error", error=str(exc))
+        return PluginReport(id=plugin_id, status="error", error=str(exc), mode=mode)
 
     if old_sha == new_sha:
+        clear_first_seen(plugin_id)
         return PluginReport(
             id=plugin_id,
             status="up_to_date",
             from_sha=old_sha,
             to_sha=new_sha,
             origin=origin,
+            mode=mode,
+        )
+
+    if is_ancestor(path, new_sha, old_sha):
+        # Origin rewound, or this checkout carries local commits. A fast-forward
+        # to an ancestor is a no-op, so there is nothing to review or apply.
+        clear_first_seen(plugin_id)
+        return PluginReport(
+            id=plugin_id,
+            status="ahead",
+            from_sha=old_sha,
+            to_sha=new_sha,
+            origin=origin,
+            reasons=["local checkout is ahead of origin; nothing to apply"],
+            mode=mode,
         )
 
     if dirty_text:
@@ -377,12 +500,16 @@ def _review_and_maybe_apply(
             from_sha=old_sha,
             to_sha=new_sha,
             reasons=reasons or None,
+            mode=mode,
         )
 
     stored = load_baseline(plugin_id)
     history_rewritten = not is_ancestor(path, old_sha, new_sha)
     origin_changed = bool(stored and stored.origin and stored.origin != origin)
     diff_text = diff(path, old_sha, new_sha)
+    diff_truncated = len(diff_text) > DIFF_LIMIT
+    diff_lines = count_diff_lines(diff_text)
+    first_seen = note_first_seen(plugin_id, new_sha)
 
     with tempfile.TemporaryDirectory(prefix="omarchy-plugin-guard-") as raw:
         tmp = Path(raw)
@@ -397,61 +524,108 @@ def _review_and_maybe_apply(
             for item in capability_expansion(stored.capabilities, new_caps):
                 if item not in expansion:
                     expansion.append(item)
-        work = tmp / "review"
-        _write_review_workspace(work, new_tree, findings, new_caps, expansion, diff_text)
-        agent = _maybe_agent(
-            work,
-            plugin_id=plugin_id,
-            origin=origin,
-            old_sha=old_sha,
-            new_sha=new_sha,
-            expansion=expansion,
-            findings=findings,
-            caps=new_caps,
-            diff_text=diff_text,
-            skip_agent=skip_agent,
-        )
-        blocked = has_block_findings(findings)
-        combined = combine_verdict(
-            blocked=blocked,
-            expansion=expansion,
-            origin_changed=origin_changed,
-            history_rewritten=history_rewritten,
-            has_baseline=stored is not None,
-            agent_verdict=None if agent is None or agent.get("error") else agent.get("verdict"),
-            agent_error=None if agent is None else agent.get("error"),
-        )
-        report = PluginReport(
-            id=plugin_id,
-            status="reviewed",
-            verdict=combined.verdict,
-            from_sha=old_sha,
-            to_sha=new_sha,
-            origin=origin,
-            expansion=expansion,
-            reasons=combined.reasons,
-            findings=findings_to_dict(findings),
-            agent=agent,
-        )
-        _save_review(report)
-        if dry_run:
-            return report
-        if combined.verdict == "deny":
-            _print_human_gate(report, action="update")
-            report.status = "denied"
-            return report
-        if not _should_apply(report, assume_yes=assume_yes, force=force, action="update"):
-            report.status = "skipped"
-            return report
+        work = _review_workspace()
         try:
-            apply_reviewed_update(path, new_sha)
-        except ApplyError as exc:
-            report.status = "error"
-            report.error = str(exc)
-            return report
-        save_baseline(plugin_id, origin, new_sha, new_caps)
-        report.status = "applied"
+            _write_review_workspace(work, new_tree, findings, new_caps, expansion, diff_text)
+            agent = _maybe_agent(
+                work,
+                plugin_id=plugin_id,
+                origin=origin,
+                old_sha=old_sha,
+                new_sha=new_sha,
+                expansion=expansion,
+                findings=findings,
+                caps=new_caps,
+                diff_text=diff_text,
+                skip_agent=skip_agent,
+                model=model,
+            )
+        finally:
+            _discard_workspace(work)
+
+    report = PluginReport(
+        id=plugin_id,
+        status="reviewed",
+        from_sha=old_sha,
+        to_sha=new_sha,
+        origin=origin,
+        expansion=expansion,
+        findings=findings_to_dict(findings),
+        agent=agent,
+        diff_lines=diff_lines,
+        diff_truncated=diff_truncated,
+        first_seen_at=first_seen.isoformat(timespec="seconds"),
+        mode=mode,
+    )
+    if agent and agent.get("error"):
+        # Not a judgement about the plugin: report it, keep the SHA pending,
+        # and let the next run retry.
+        report.status = "error"
+        report.error = f"agent review failed: {agent['error']}"
+        _save_review(report)
+        _audit(report)
         return report
+
+    blocked = has_block_findings(findings)
+    combined = combine_verdict(
+        blocked=blocked,
+        expansion=expansion,
+        origin_changed=origin_changed,
+        history_rewritten=history_rewritten,
+        has_baseline=stored is not None,
+        agent_verdict=None if agent is None else agent.get("verdict"),
+        diff_truncated=diff_truncated,
+        agent_denied_calls=0 if agent is None else int(agent.get("denied_calls") or 0),
+    )
+    report.verdict = combined.verdict
+    report.reasons = combined.reasons
+    _save_review(report)
+    if dry_run:
+        _audit(report)
+        return report
+    if combined.verdict == "deny":
+        _print_human_gate(report, action="update")
+        report.status = "denied"
+        _audit(report)
+        return report
+
+    if policy is not None:
+        if combined.verdict != "allow":
+            _print_human_gate(report, action="update")
+            _audit(report)
+            return report
+        decision = evaluate_auto_apply(
+            policy=policy,
+            verdict=combined.verdict,
+            diff_truncated=diff_truncated,
+            diff_lines=diff_lines,
+            old_caps=stored.capabilities if stored else None,
+            new_caps=new_caps,
+            first_seen_at=first_seen,
+            now=now_utc(),
+        )
+        if not decision.apply:
+            report.status = "deferred"
+            report.policy = decision.reasons
+            _audit(report)
+            return report
+    elif not _should_apply(report, assume_yes=assume_yes, force=force, action="update"):
+        report.status = "skipped"
+        _audit(report)
+        return report
+
+    try:
+        apply_reviewed_update(path, new_sha)
+    except ApplyError as exc:
+        report.status = "error"
+        report.error = str(exc)
+        _audit(report)
+        return report
+    save_baseline(plugin_id, origin, new_sha, new_caps)
+    clear_first_seen(plugin_id)
+    report.status = "applied"
+    _audit(report)
+    return report
 
 
 def _maybe_agent(
@@ -466,14 +640,15 @@ def _maybe_agent(
     caps: Capabilities,
     diff_text: str,
     skip_agent: bool,
+    model: str | None = None,
 ) -> dict[str, Any] | None:
     if skip_agent:
         _progress(f"skipping agent review of {plugin_id}")
         return None
-    model = os.environ.get("CURSOR_MODEL", "composer-2.5").strip() or "composer-2.5"
+    chosen = (model or "").strip() or default_model()
     _progress(
-        f"starting agent review of {plugin_id} with {model}; "
-        "this often looks idle for 30–90s until the agent returns"
+        f"starting agent review of {plugin_id} with claude ({chosen}); "
+        "this often looks idle for 30–120s until the agent returns"
     )
     scan_payload = {
         "findings": findings_to_dict(findings),
@@ -490,17 +665,35 @@ def _maybe_agent(
             expansion=expansion,
             scan_payload=scan_payload,
             diff_text=diff_text,
+            model=chosen,
         )
     except ReviewError as exc:
         _progress(f"agent review failed: {exc}")
-        return {"error": str(exc)}
+        return {"error": str(exc), "model": chosen}
     _progress(f"agent finished: {review.verdict}")
     return {
         "verdict": review.verdict,
         "summary": review.summary,
         "findings": review.findings,
         "run_id": review.run_id,
+        "model": chosen,
+        "denied_calls": review.denied_calls,
+        "turns": review.turns,
+        "cost_usd": review.cost_usd,
     }
+
+
+def _review_workspace() -> Path:
+    """A fixed path, so every headless session maps to one Claude project dir."""
+    work = state_dir() / "workspace"
+    if work.exists():
+        shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+    return work
+
+
+def _discard_workspace(work: Path) -> None:
+    shutil.rmtree(work, ignore_errors=True)
 
 
 def _write_review_workspace(
@@ -516,13 +709,15 @@ def _write_review_workspace(
     if snapshot_dir.resolve() != dest.resolve():
         if dest.exists():
             shutil.rmtree(dest)
-        shutil.copytree(snapshot_dir, dest)
+        shutil.copytree(snapshot_dir, dest, symlinks=True, ignore=shutil.ignore_patterns(".git"))
+    renamed = sanitize_snapshot(dest)
     (work / "SCAN.json").write_text(
         json.dumps(
             {
                 "findings": findings_to_dict(findings),
                 "capabilities": caps.to_dict(),
                 "expansion": expansion,
+                "renamed_instruction_files": renamed,
             },
             indent=2,
         )
@@ -533,6 +728,26 @@ def _write_review_workspace(
     if len(body) > DIFF_LIMIT:
         body = body[:DIFF_LIMIT] + "\n\n[truncated]\n"
     (work / "DIFF.patch").write_text(body, encoding="utf-8")
+
+
+def sanitize_snapshot(root: Path) -> list[str]:
+    """Rename agent-instruction files so no harness mistakes them for config.
+
+    Returns the relative paths that were renamed, for the scan report.
+    """
+    renamed: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+        base = Path(dirpath)
+        for name in list(dirnames) + list(filenames):
+            if name not in UNTRUSTED_INSTRUCTION_NAMES:
+                continue
+            src = base / name
+            dst = base / f"{UNTRUSTED_PREFIX}{name}"
+            src.rename(dst)
+            renamed.append(src.relative_to(root).as_posix())
+            if name in dirnames:
+                dirnames[dirnames.index(name)] = dst.name
+    return sorted(renamed)
 
 
 def format_human_gate(report: PluginReport, *, action: str) -> str:
@@ -635,6 +850,35 @@ def _save_review(report: PluginReport) -> None:
     path.write_text(json.dumps(report.to_dict(), indent=2) + "\n", encoding="utf-8")
 
 
+def _audit(report: PluginReport) -> None:
+    agent = report.agent or {}
+    agent_summary = {
+        key: agent.get(key)
+        for key in ("verdict", "summary", "findings", "run_id", "model", "denied_calls", "error")
+        if agent.get(key) not in (None, "", [], 0)
+    }
+    blocks = [item for item in (report.findings or []) if item.get("severity") == "block"]
+    event = {
+        "event": report.status,
+        "plugin": report.id,
+        "mode": report.mode,
+        "verdict": report.verdict,
+        "from": report.from_sha or None,
+        "to": report.to_sha or None,
+        "origin": report.origin or None,
+        "reasons": report.reasons,
+        "expansion": report.expansion or None,
+        "policy": report.policy,
+        "diff_lines": report.diff_lines,
+        "diff_truncated": report.diff_truncated,
+        "first_seen_at": report.first_seen_at,
+        "agent": agent_summary or None,
+        "blocks": blocks or None,
+        "error": report.error,
+    }
+    append_audit({key: value for key, value in event.items() if value is not None})
+
+
 def _emit(reports: list[PluginReport], as_json: bool) -> int:
     if as_json:
         print(json.dumps({"results": [item.to_dict() for item in reports]}, indent=2))
@@ -663,6 +907,9 @@ def _print_report(item: PluginReport) -> None:
     if item.reasons:
         for reason in item.reasons:
             print(f"  {reason}")
+    if item.policy:
+        for reason in item.policy:
+            print(f"  auto-apply deferred: {reason}")
     if item.expansion and not any(
         reason.startswith("capability expansion") for reason in (item.reasons or [])
     ):
@@ -676,6 +923,47 @@ def _print_report(item: PluginReport) -> None:
         print(f"  agent: {item.agent['summary']}")
     if item.agent and item.agent.get("error"):
         print(f"  agent error: {item.agent['error']}")
+
+
+def summarize_for_notification(reports: list[PluginReport]) -> tuple[str, str, str] | None:
+    """(title, body, urgency) for notify-send, or None when there is nothing to say."""
+    applied = [r.id for r in reports if r.status == "applied"]
+    ready = [r.id for r in reports if r.status in {"reviewed", "deferred"} and r.verdict == "allow"]
+    human = [r.id for r in reports if r.status == "reviewed" and r.verdict == "needs-human"]
+    denied = [r.id for r in reports if r.status == "denied" or r.verdict == "deny"]
+    errors = [r.id for r in reports if r.status in {"error", "blocked"}]
+    if not any((applied, ready, human, denied, errors)):
+        return None
+    lines: list[str] = []
+    if applied:
+        lines.append(f"applied: {', '.join(applied)}")
+    if ready:
+        lines.append(f"allow, run update --yes: {', '.join(ready)}")
+    if human:
+        lines.append(f"needs human: {', '.join(human)}")
+    if denied:
+        lines.append(f"DENIED: {', '.join(denied)}")
+    if errors:
+        lines.append(f"errors: {', '.join(errors)}")
+    total = len(applied) + len(ready) + len(human) + len(denied) + len(errors)
+    title = f"omarchy-plugin-guard: {total} plugin update{'s' if total != 1 else ''}"
+    urgency = "critical" if denied or errors else "normal"
+    return title, "\n".join(lines), urgency
+
+
+def _notify(reports: list[PluginReport]) -> None:
+    binary = shutil.which("notify-send")
+    if not binary:
+        return
+    summary = summarize_for_notification(reports)
+    if summary is None:
+        return
+    title, body, urgency = summary
+    subprocess.run(
+        [binary, "-a", "omarchy-plugin-guard", "-u", urgency, title, body],
+        capture_output=True,
+        text=True,
+    )
 
 
 def _selected_plugins(ids: list[str]) -> list[Path]:
