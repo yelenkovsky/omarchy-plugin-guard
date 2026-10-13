@@ -144,6 +144,34 @@ home = "~/.ssh/id_rsa"
             self.assertFalse(has_block_findings(findings))
             self.assertIn("flag:credential_stores", capability_expansion(Capabilities(), caps))
 
+    def test_eval_in_test_files_is_a_note_but_still_a_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            write(root, "manifest.json", '{"kinds":["bar-widget"]}')
+            write(root, "Main.qml", "Item {}\n")
+            write(root, "tests/js/model-test.js", 'const M = {}; new Function("x", "eval(k)")(M)\n')
+            findings, caps = scan_tree(root)
+            evals = [item for item in findings if item.rule == "eval_dynamic"]
+            self.assertEqual(len(evals), 1)
+            self.assertEqual(evals[0].severity, "note")
+            self.assertIn("test file", evals[0].snippet)
+            self.assertFalse(has_block_findings(findings))
+            self.assertTrue(caps.flags["eval_dynamic"])
+            # A tree without the test file sees it as an expansion.
+            self.assertIn("flag:eval_dynamic", capability_expansion(Capabilities(), caps))
+            # The same eval outside a test path is still a hard block.
+            write(root, "Model.js", "function f(k) { return eval(k) }\n")
+            findings, _caps = scan_tree(root)
+            self.assertTrue(has_block_findings(findings))
+
+    def test_is_test_path(self) -> None:
+        from omarchy_plugin_guard.scan import is_test_path
+
+        for rel in ("tests/js/model-test.js", "test/a.js", "src/__tests__/b.js", "spec/c.js", "Model.test.js", "x_spec.mjs"):
+            self.assertTrue(is_test_path(rel), rel)
+        for rel in ("Main.qml", "Model.js", "contest/a.js", "scripts/latest.js", "testing/a.js"):
+            self.assertFalse(is_test_path(rel), rel)
+
     def test_symlink_is_block(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

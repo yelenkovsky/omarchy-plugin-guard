@@ -278,11 +278,19 @@ def scan_tree(root: Path) -> tuple[list[Finding], Capabilities]:
             unexpected.append(rel)
             continue
 
+        test_path = is_test_path(rel)
         for rule, severity, pattern in CONTENT_RULES:
             for match in pattern.finditer(text):
                 line = text.count("\n", 0, match.start()) + 1
                 snippet = _clip(match.group(0))
-                findings.append(Finding(rule, severity, rel, line, snippet))
+                effective = severity
+                if rule == "eval_dynamic" and severity == BLOCK and test_path:
+                    # A test harness under tests/ is never loaded by the shell.
+                    # Keep the capability flag so a *new* eval in tests is still
+                    # an expansion that needs a human, but do not hard-deny.
+                    effective = NOTE
+                    snippet = f"{snippet} (test file; note only)"
+                findings.append(Finding(rule, effective, rel, line, snippet))
                 if rule in flags:
                     flags[rule] = True
 
@@ -301,6 +309,18 @@ def scan_tree(root: Path) -> tuple[list[Finding], Capabilities]:
         command_lines=sorted(commands),
     )
     return findings, caps
+
+
+TEST_DIR_NAMES = {"test", "tests", "__tests__", "spec", "specs"}
+TEST_FILE_RE = re.compile(r"(?:[._-]test|[._-]spec)\.[cm]?js$", re.IGNORECASE)
+
+
+def is_test_path(rel: str) -> bool:
+    """True for files under a test directory or named like a JS test."""
+    parts = rel.split("/")
+    if any(part.lower() in TEST_DIR_NAMES for part in parts[:-1]):
+        return True
+    return bool(TEST_FILE_RE.search(parts[-1]))
 
 
 def iter_command_arrays(text: str) -> Iterable[str]:
