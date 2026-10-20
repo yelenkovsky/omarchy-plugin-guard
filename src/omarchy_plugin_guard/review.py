@@ -165,6 +165,7 @@ def run_agent_review(
             input=prompt,
             capture_output=True,
             text=True,
+            check=False,
             cwd=str(workspace),
             env=env,
             timeout=timeout,
@@ -184,9 +185,9 @@ def parse_claude_result(stdout: str, *, stderr: str = "", returncode: int = 0) -
         raise ReviewError(f"agent produced no output ({detail})")
     try:
         data = json.loads(text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
         if returncode != 0:
-            raise ReviewError(f"agent exited {returncode}: {(stderr or text).strip()[:300]}")
+            raise ReviewError(f"agent exited {returncode}: {(stderr or text).strip()[:300]}") from exc
         return parse_agent_verdict(text)
     if not isinstance(data, dict):
         raise ReviewError("agent output is not a JSON object")

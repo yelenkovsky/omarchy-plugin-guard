@@ -60,9 +60,8 @@ def evaluate_auto_apply(
         reasons.append("no stored baseline")
     elif old_caps.runs_code():
         reasons.append("plugin already runs commands or code; auto-apply is for declarative QML only")
-    if new_caps.runs_code():
-        if not reasons or "runs commands" not in reasons[-1]:
-            reasons.append("incoming tree runs commands or code; auto-apply is for declarative QML only")
+    if new_caps.runs_code() and (not reasons or "runs commands" not in reasons[-1]):
+        reasons.append("incoming tree runs commands or code; auto-apply is for declarative QML only")
     age = now - first_seen_at
     needed = timedelta(days=policy.soak_days)
     if age < needed:
@@ -77,9 +76,9 @@ def evaluate_auto_apply(
 def count_diff_lines(diff_text: str) -> int:
     count = 0
     for line in diff_text.splitlines():
-        if line.startswith("+++") or line.startswith("---"):
+        if line.startswith(("+++", "---")):
             continue
-        if line.startswith("+") or line.startswith("-"):
+        if line.startswith(("+", "-")):
             count += 1
     return count
 

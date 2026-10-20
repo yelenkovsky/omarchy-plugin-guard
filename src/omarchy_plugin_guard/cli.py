@@ -963,6 +963,7 @@ def _notify(reports: list[PluginReport]) -> None:
         [binary, "-a", "omarchy-plugin-guard", "-u", urgency, title, body],
         capture_output=True,
         text=True,
+        check=False,
     )
 
 

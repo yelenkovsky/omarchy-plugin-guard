@@ -13,7 +13,7 @@ class ApplyError(RuntimeError):
 
 
 def run_cmd(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(args, capture_output=True, text=True)
+    result = subprocess.run(args, capture_output=True, text=True, check=False)
     if check and result.returncode != 0:
         detail = (result.stderr or result.stdout).strip() or "command failed"
         raise ApplyError(f"{' '.join(args)}: {detail}")
@@ -45,6 +45,7 @@ def rescan_plugins() -> None:
         ["omarchy-shell", "shell", "rescanPlugins"],
         capture_output=True,
         text=True,
+        check=False,
     )
 
 
@@ -77,6 +78,7 @@ def enable_plugin(plugin_id: str) -> None:
             ["omarchy", "plugin", "enable", plugin_id],
             capture_output=True,
             text=True,
+            check=False,
         )
         if result.returncode == 0:
             return

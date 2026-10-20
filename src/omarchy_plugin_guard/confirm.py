@@ -12,7 +12,7 @@ def confirm(prompt: str, *, assume_yes: bool) -> bool:
         return False
     gum = shutil.which("gum")
     if gum:
-        result = subprocess.run([gum, "confirm", prompt])
+        result = subprocess.run([gum, "confirm", prompt], check=False)
         return result.returncode == 0
     answer = input(f"{prompt} [y/N] ").strip().lower()
     return answer in {"y", "yes"}

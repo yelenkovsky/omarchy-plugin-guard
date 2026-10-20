@@ -8,10 +8,11 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from omarchy_plugin_guard.paths import state_dir
 
@@ -21,7 +22,7 @@ class LockHeld(RuntimeError):
 
 
 def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _iso(moment: datetime) -> str:
@@ -37,31 +38,30 @@ def run_lock() -> Iterator[None]:
     """
     state_dir().mkdir(parents=True, exist_ok=True)
     path = state_dir() / "lock"
-    handle = open(path, "a+", encoding="utf-8")
-    try:
+    with open(path, "a+", encoding="utf-8") as handle:
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            holder = ""
             try:
-                handle.seek(0)
-                holder = handle.read().strip()
-            except OSError:
-                pass
-            detail = f" (held by {holder})" if holder else ""
-            raise LockHeld(f"another omarchy-plugin-guard run is in progress{detail}") from exc
-        handle.seek(0)
-        handle.truncate()
-        handle.write(f"pid {os.getpid()} since {_iso(now_utc())}\n")
-        handle.flush()
-        yield
-    finally:
-        try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                holder = ""
+                try:
+                    handle.seek(0)
+                    holder = handle.read().strip()
+                except OSError:
+                    pass
+                detail = f" (held by {holder})" if holder else ""
+                raise LockHeld(f"another omarchy-plugin-guard run is in progress{detail}") from exc
             handle.seek(0)
             handle.truncate()
-        except OSError:
-            pass
-        handle.close()
+            handle.write(f"pid {os.getpid()} since {_iso(now_utc())}\n")
+            handle.flush()
+            yield
+        finally:
+            try:
+                handle.seek(0)
+                handle.truncate()
+            except OSError:
+                pass
 
 
 def audit_path() -> Path:
