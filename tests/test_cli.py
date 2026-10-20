@@ -90,9 +90,12 @@ def _env(plugins: Path, state: Path):
 def _run(plugins: Path, state: Path, *argv: str) -> tuple[int, str, str]:
     stdout = io.StringIO()
     stderr = io.StringIO()
-    with _env(plugins, state):
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            code = main(list(argv))
+    with (
+        _env(plugins, state),
+        contextlib.redirect_stdout(stdout),
+        contextlib.redirect_stderr(stderr),
+    ):
+        code = main(list(argv))
     return code, stdout.getvalue(), stderr.getvalue()
 
 
@@ -124,9 +127,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 0)
 
     def test_auto_and_force_are_exclusive(self) -> None:
-        with contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit) as ctx:
-                main(["update", "--auto", "--force"])
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as ctx:
+            main(["update", "--auto", "--force"])
         self.assertEqual(ctx.exception.code, 2)
 
     def test_baseline_and_status_in_temp_dirs(self) -> None:
@@ -349,7 +351,7 @@ class AutoApplyTests(unittest.TestCase):
             origin, plugins, state = self._fixture(root, shell)
             _push_upstream(origin, 'Process { command: ["bash", "-c", "date; id"] }\n')
             with mock.patch.object(cli, "run_agent_review", _fake_agent("allow")):
-                code, payload = _run_json(plugins, state, "review", "demo.clock")
+                _, payload = _run_json(plugins, state, "review", "demo.clock")
             result = payload["results"][0]
             self.assertEqual(result["verdict"], "needs-human")
             self.assertTrue(any(item.startswith("command:") for item in result["expansion"]))
@@ -364,11 +366,10 @@ class LockTests(unittest.TestCase):
             state = root / "state"
             from omarchy_plugin_guard.state import run_lock
 
-            with _env(plugins, state):
-                with run_lock():
-                    stderr = io.StringIO()
-                    with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
-                        code = main(["review"])
+            with _env(plugins, state), run_lock():
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                    code = main(["review"])
             self.assertEqual(code, 1)
             self.assertIn("another omarchy-plugin-guard run is in progress", stderr.getvalue())
 

@@ -27,6 +27,7 @@ def git(
             ["git", "-C", str(repo), *args],
             capture_output=True,
             text=True,
+            check=False,
             env=_env(),
             timeout=timeout,
         )
@@ -70,6 +71,7 @@ def clone(url: str, dest: Path) -> None:
             ["git", "clone", "--", url, str(dest)],
             capture_output=True,
             text=True,
+            check=False,
             env=_env(),
             timeout=90,
         )
@@ -101,6 +103,7 @@ def snapshot(repo: Path, rev: str, dest: Path) -> None:
     archive = subprocess.run(
         ["git", "-C", str(repo), "archive", "--format=tar", rev],
         capture_output=True,
+        check=False,
         env=_env(),
     )
     if archive.returncode != 0:
@@ -110,6 +113,7 @@ def snapshot(repo: Path, rev: str, dest: Path) -> None:
         ["tar", "-xf", "-", "-C", str(dest)],
         input=archive.stdout,
         capture_output=True,
+        check=False,
     )
     if extract.returncode != 0:
         detail = extract.stderr.decode("utf-8", "replace").strip() or "tar failed"

@@ -4,10 +4,10 @@ import hashlib
 import json
 import re
 import stat
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
-
+from typing import Any
 
 BLOCK = "block"
 NOTE = "note"

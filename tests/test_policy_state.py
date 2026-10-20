@@ -4,7 +4,7 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from omarchy_plugin_guard.policy import AutoPolicy, count_diff_lines, evaluate_auto_apply
@@ -18,7 +18,7 @@ from omarchy_plugin_guard.state import (
     run_lock,
 )
 
-NOW = datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 10, 12, 12, 0, tzinfo=UTC)
 
 
 def declarative() -> Capabilities:
@@ -75,13 +75,13 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(any("runs commands" in reason for reason in decision.reasons))
 
     def test_size_truncation_and_verdict_gates(self) -> None:
-        base = dict(
-            policy=AutoPolicy(soak_days=0, max_diff_lines=100),
-            old_caps=declarative(),
-            new_caps=declarative(),
-            first_seen_at=NOW - timedelta(days=1),
-            now=NOW,
-        )
+        base = {
+            "policy": AutoPolicy(soak_days=0, max_diff_lines=100),
+            "old_caps": declarative(),
+            "new_caps": declarative(),
+            "first_seen_at": NOW - timedelta(days=1),
+            "now": NOW,
+        }
         too_big = evaluate_auto_apply(verdict="allow", diff_truncated=False, diff_lines=101, **base)
         self.assertFalse(too_big.apply)
         truncated = evaluate_auto_apply(verdict="allow", diff_truncated=True, diff_lines=10, **base)
@@ -121,19 +121,17 @@ class StateTests(unittest.TestCase):
         return Path(raw.name), cleanup
 
     def test_lock_is_exclusive(self) -> None:
-        state, cleanup = self._with_state()
+        _, cleanup = self._with_state()
         try:
-            with run_lock():
-                with self.assertRaises(LockHeld):
-                    with run_lock():
-                        pass
+            with run_lock(), self.assertRaises(LockHeld), run_lock():
+                pass
             with run_lock():
                 pass
         finally:
             cleanup()
 
     def test_audit_appends_json_lines(self) -> None:
-        state, cleanup = self._with_state()
+        _, cleanup = self._with_state()
         try:
             append_audit({"event": "reviewed", "plugin": "a"})
             append_audit({"event": "applied", "plugin": "a"})
