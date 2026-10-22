@@ -447,8 +447,7 @@ def _review_and_maybe_apply(
         origin = remote_url(path)
         old_sha = rev_parse(path, "HEAD")
         print(f"Fetching {plugin_id}...", file=sys.stderr, flush=True)
-        fetch_origin(path)
-        new_sha = rev_parse(path, "FETCH_HEAD")
+        new_sha = fetch_origin(path)
         dirty_text = git(path, "status", "--porcelain").stdout
         incoming = []
         if old_sha != new_sha:
