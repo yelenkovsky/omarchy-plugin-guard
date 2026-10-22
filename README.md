@@ -3,7 +3,7 @@
 ```mermaid
 flowchart TD
   start["omarchy-plugin-guard add / update / review"] --> fetch["git fetch or clone"]
-  fetch --> snap["Snapshot FETCH_HEAD<br/>live plugins dir is not written"]
+  fetch --> snap["Snapshot the fetched SHA<br/>live plugins dir is not written"]
   snap --> scan["Mechanical scan<br/>Process, network, pipe-to-shell,<br/>credential paths, new binaries,<br/>full command-line signatures"]
   scan --> agent["Headless Claude Code agent<br/>tools: Read (workspace only), Grep, Glob<br/>no settings, hooks, MCP, CLAUDE.md"]
   agent --> verdict{"Combined verdict"}
@@ -27,8 +27,8 @@ This is a command-line tool, not an Omarchy bar plugin. Install it with pip, the
 
 ## How it works
 
-1. **Fetch** — `git fetch` only. The live tree under `~/.config/omarchy/plugins` stays untouched.
-2. **Scan** — snapshot `FETCH_HEAD` and look for Process/exec, network, credential paths, pipe-to-shell, new binaries. Every `command: [...]` array gets a signature, so a changed string inside an existing `bash -c` counts as a capability expansion even when the first token did not change. Compare to the previous commit and the stored baseline.
+1. **Fetch** — `git fetch` only, into `refs/omarchy-plugin-guard/incoming`. `FETCH_HEAD` is neither read nor written: `omarchy plugin update` and plugins such as omaplug fetch into the same checkouts from inside omarchy-shell, and git leaves `FETCH_HEAD` empty while a fetch is in flight. The live tree under `~/.config/omarchy/plugins` stays untouched.
+2. **Scan** — snapshot that commit and look for Process/exec, network, credential paths, pipe-to-shell, new binaries. Every `command: [...]` array gets a signature, so a changed string inside an existing `bash -c` counts as a capability expansion even when the first token did not change. Compare to the previous commit and the stored baseline.
 3. **Agent** — a headless Claude Code session (`claude -p`) reads the diff and the snapshot with Read, Grep and Glob only. It runs with no settings, hooks, MCP servers, CLAUDE.md or auto-memory from your machine, a replaced system prompt, and Read scoped to the review workspace. Files such as `CLAUDE.md` or `.claude/` inside the plugin are renamed `UNTRUSTED_*` before the agent sees them. The verdict comes back as schema-validated JSON. If the agent tried a denied tool call, the update needs a human.
 4. **Verdict** — four outcomes:
    - **ALLOW** — clean delta, agent agreed, no new capabilities. Confirm, `--yes`, or the `--auto` policy.

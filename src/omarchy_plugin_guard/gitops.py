@@ -60,8 +60,28 @@ def short_sha(sha: str) -> str:
     return sha[:12]
 
 
-def fetch_origin(repo: Path) -> None:
-    git(repo, "fetch", "--quiet", "origin", "HEAD", timeout=45)
+INCOMING_REF = "refs/omarchy-plugin-guard/incoming"
+
+
+def fetch_origin(repo: Path) -> str:
+    """Fetch origin's HEAD into a ref only this tool writes and return its SHA.
+
+    Not FETCH_HEAD: `omarchy plugin update` and plugins such as omaplug fetch
+    into the same checkouts from inside omarchy-shell, and git empties
+    FETCH_HEAD for a fetch's whole network round-trip. Reading it after our own
+    fetch can find nothing, or their result. --no-write-fetch-head keeps us from
+    doing the same to them.
+    """
+    git(
+        repo,
+        "fetch",
+        "--quiet",
+        "--no-write-fetch-head",
+        "origin",
+        f"+HEAD:{INCOMING_REF}",
+        timeout=45,
+    )
+    return rev_parse(repo, INCOMING_REF)
 
 
 def clone(url: str, dest: Path) -> None:

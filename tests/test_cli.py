@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from omarchy_plugin_guard import apply as apply_module
-from omarchy_plugin_guard import cli
+from omarchy_plugin_guard import cli, gitops
 from omarchy_plugin_guard.cli import (
     PluginReport,
     format_human_gate,
@@ -213,6 +213,46 @@ class DirtyTreeUpdateTests(unittest.TestCase):
             self.assertIn(new_sha[:8], text)
             self.assertIn("incoming", text)
             self.assertIn("upstream change", text)
+
+
+class SharedFetchHeadTests(unittest.TestCase):
+    """omaplug and `omarchy plugin update` fetch into the same checkouts."""
+
+    def test_rival_fetch_emptying_fetch_head_does_not_break_review(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            origin = root / "origin"
+            plugins = root / "plugins"
+            _init_origin(origin)
+            plugin = _clone_plugin(origin, plugins)
+            new_sha = _push_upstream(origin, "Item { width: 6 }\n")
+            real_git = gitops.git
+
+            def git_with_rival_fetch(repo, *args, **kwargs):
+                result = real_git(repo, *args, **kwargs)
+                if args[:1] == ("fetch",):
+                    # Another fetch has opened FETCH_HEAD and not yet refilled it.
+                    (plugin / ".git" / "FETCH_HEAD").write_text("", encoding="utf-8")
+                return result
+
+            with mock.patch.object(gitops, "git", git_with_rival_fetch):
+                code, payload = _run_json(plugins, root / "state", "review", "demo.clock", "--skip-agent")
+            result = payload["results"][0]
+            self.assertEqual(code, 0, result.get("error"))
+            self.assertEqual(result["status"], "reviewed")
+            self.assertEqual(result["to_sha"], new_sha)
+
+    def test_fetch_leaves_fetch_head_to_other_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            origin = root / "origin"
+            plugins = root / "plugins"
+            _init_origin(origin)
+            plugin = _clone_plugin(origin, plugins)
+            _push_upstream(origin, "Item { width: 7 }\n")
+
+            _run_json(plugins, root / "state", "review", "demo.clock", "--skip-agent")
+            self.assertFalse((plugin / ".git" / "FETCH_HEAD").exists())
 
 
 class AgentOutcomeTests(unittest.TestCase):
