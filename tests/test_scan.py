@@ -8,6 +8,7 @@ from pathlib import Path
 from omarchy_plugin_guard.scan import (
     Capabilities,
     capability_expansion,
+    carry_over_blocks,
     command_signature,
     has_block_findings,
     iter_command_arrays,
@@ -215,6 +216,48 @@ home = "~/.ssh/id_rsa"
             changes = capability_expansion(old, new)
             self.assertIn("process:curl", changes)
             self.assertNotIn("flag:process", changes)
+
+    def test_block_already_installed_is_carried_over_as_note(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            write(root, "manifest.json", '{"kinds":["bar-widget"]}')
+            write(root, "bin/tool", '# an icon "at" ~/.ssh/id_rsa is refused\n', executable=True)
+            old, old_caps = scan_tree(root)
+            self.assertTrue(has_block_findings(old))
+            # Lines above the comment move it; it is still the same finding.
+            write(
+                root,
+                "bin/tool",
+                'set -e\nset -u\n# an icon "at" ~/.ssh/id_rsa is refused\n',
+                executable=True,
+            )
+            new, new_caps = scan_tree(root)
+            carried = carry_over_blocks(old, new)
+            self.assertFalse(has_block_findings(carried))
+            credentials = [item for item in carried if item.rule == "credentials"]
+            self.assertTrue(credentials)
+            self.assertTrue(all("already installed" in item.snippet for item in credentials))
+            self.assertEqual({item.line for item in credentials}, {3})
+            self.assertNotIn("flag:credentials", capability_expansion(old_caps, new_caps))
+
+    def test_new_block_still_blocks_beside_a_carried_one(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            write(root, "manifest.json", '{"kinds":["bar-widget"]}')
+            write(root, "Main.qml", 'var a = "~/.ssh/id_rsa"\n')
+            old, _caps = scan_tree(root)
+            # A second copy of the same match, and the same match in another file.
+            write(root, "Main.qml", 'var a = "~/.ssh/id_rsa"\nvar b = "~/.ssh/id_rsa"\n')
+            write(root, "Other.qml", 'var c = "~/.ssh/id_rsa"\n')
+            new, _caps = scan_tree(root)
+            carried = carry_over_blocks(old, new)
+            blocks = [(item.path, item.line) for item in carried if item.severity == "block"]
+            self.assertEqual(
+                sorted(set(blocks)), [("Main.qml", 2), ("Other.qml", 1)]
+            )
+            self.assertTrue(
+                all(item.severity == "note" for item in carried if (item.path, item.line) == ("Main.qml", 1))
+            )
 
 
 class VerdictTests(unittest.TestCase):
