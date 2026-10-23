@@ -4,8 +4,9 @@ import hashlib
 import json
 import re
 import stat
+from collections import Counter
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -391,6 +392,34 @@ def capability_expansion(old: Capabilities, new: Capabilities) -> list[str]:
             if signature not in old_commands:
                 changes.append(f"command:{signature}")
     return changes
+
+
+def carry_over_blocks(old: Iterable[Finding], new: list[Finding]) -> list[Finding]:
+    """Downgrade block findings the installed tree already had to notes.
+
+    An update is judged on what it changes. A block that was already present
+    when the plugin was installed would otherwise deny every update after it,
+    whatever that update touched. Matching is by rule, path and matched text,
+    not line number, so an edit above a finding does not make it look new; it
+    is counted, so a second copy of the same match in the same file still
+    blocks. The capability flag is untouched either way.
+    """
+    remaining = Counter(
+        (item.rule, item.path, item.snippet) for item in old if item.severity == BLOCK
+    )
+    result: list[Finding] = []
+    for item in new:
+        key = (item.rule, item.path, item.snippet)
+        if item.severity == BLOCK and remaining[key] > 0:
+            remaining[key] -= 1
+            result.append(
+                replace(
+                    item, severity=NOTE, snippet=f"{item.snippet} (already installed; note only)"
+                )
+            )
+        else:
+            result.append(item)
+    return result
 
 
 def has_block_findings(findings: Iterable[Finding]) -> bool:

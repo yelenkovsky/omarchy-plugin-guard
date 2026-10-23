@@ -43,6 +43,7 @@ from omarchy_plugin_guard.review import ReviewError, default_model, run_agent_re
 from omarchy_plugin_guard.scan import (
     Capabilities,
     capability_expansion,
+    carry_over_blocks,
     findings_to_dict,
     has_block_findings,
     scan_tree,
@@ -516,8 +517,9 @@ def _review_and_maybe_apply(
         new_tree = tmp / "snapshot"
         snapshot(path, old_sha, old_tree)
         snapshot(path, new_sha, new_tree)
-        _, old_caps = scan_tree(old_tree)
+        old_findings, old_caps = scan_tree(old_tree)
         findings, new_caps = scan_tree(new_tree)
+        findings = carry_over_blocks(old_findings, findings)
         expansion = capability_expansion(old_caps, new_caps)
         if stored:
             for item in capability_expansion(stored.capabilities, new_caps):

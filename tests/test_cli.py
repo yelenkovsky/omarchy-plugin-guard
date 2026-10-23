@@ -316,6 +316,36 @@ class AgentOutcomeTests(unittest.TestCase):
             self.assertTrue((state / "reviews" / "demo.clock.json").is_file())
             self.assertFalse((state / "workspace").exists())
 
+    def test_block_already_installed_does_not_deny_an_unrelated_update(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            origin = root / "origin"
+            plugins = root / "plugins"
+            state = root / "state"
+            comment = '// an icon "at" ~/.ssh/id_rsa is refused\n'
+            _init_origin(origin, comment + "Item {}\n")
+            _clone_plugin(origin, plugins)
+            _run(plugins, state, "baseline", "demo.clock")
+            _push_upstream(origin, comment + "Item { width: 6 }\n")
+            with mock.patch.object(cli, "run_agent_review", _fake_agent("allow")):
+                _, payload = _run_json(plugins, state, "review", "demo.clock")
+            result = payload["results"][0]
+            self.assertEqual(result["verdict"], "allow")
+            credentials = [item for item in result["findings"] if item["rule"] == "credentials"]
+            self.assertTrue(credentials)
+            self.assertTrue(all(item["severity"] == "note" for item in credentials))
+
+    def test_block_introduced_by_the_update_still_denies(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            origin, plugins, state = self._fixture(root)
+            _push_upstream(origin, 'Item { property string k: "~/.ssh/id_rsa" }\n')
+            with mock.patch.object(cli, "run_agent_review", _fake_agent("allow")):
+                _, payload = _run_json(plugins, state, "review", "demo.clock")
+            result = payload["results"][0]
+            self.assertEqual(result["verdict"], "deny")
+            self.assertIn("mechanical block finding", result["reasons"])
+
 
 class AutoApplyTests(unittest.TestCase):
     def _fixture(self, root: Path, main_qml: str = "Item {}\n") -> tuple[Path, Path, Path]:
