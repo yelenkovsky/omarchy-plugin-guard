@@ -33,7 +33,7 @@ This is a command-line tool, not an Omarchy bar plugin. Install it with pip, the
 4. **Verdict** — four outcomes:
    - **ALLOW** — clean delta, agent agreed, no new capabilities. Confirm, `--yes`, or the `--auto` policy.
    - **NEEDS HUMAN** — new Process/network/binary, a changed command line, first install, truncated diff, denied agent tool calls, or the agent is unsure. Prints **NEEDS HUMAN REVIEW** and the reasons, then asks accept or deny. `--yes` and `--auto` will not skip this; `--force` will.
-   - **DENY** — pipe-to-shell, credential-path hits, or agent deny. Prints **DENIED — will not apply**. Never merges. `--force` does not override.
+   - **DENY** — pipe-to-shell, credential-path hits, or agent deny. Pipe-to-shell and `eval` inside a test path (`tests/`, `*.test.js`, …) are notes instead: the flag still counts, so a new one is **NEEDS HUMAN**. Prints **DENIED — will not apply**. Never merges. `--force` does not override.
    - **ERROR** — the agent could not run (not logged in, timeout, outage). Nothing is applied and nothing is recorded as a judgement; the next run retries.
 5. **Merge** — fast-forward the reviewed SHA, then `omarchy plugin validate`. A later commit that landed on GitHub during the review is not pulled in.
 
