@@ -285,10 +285,12 @@ def scan_tree(root: Path) -> tuple[list[Finding], Capabilities]:
                 line = text.count("\n", 0, match.start()) + 1
                 snippet = _clip(match.group(0))
                 effective = severity
-                if rule == "eval_dynamic" and severity == BLOCK and test_path:
-                    # A test harness under tests/ is never loaded by the shell.
-                    # Keep the capability flag so a *new* eval in tests is still
-                    # an expansion that needs a human, but do not hard-deny.
+                if rule in TEST_NOTE_RULES and severity == BLOCK and test_path:
+                    # A test harness under tests/ is never loaded by the shell,
+                    # and tests often feed hostile strings in to prove they are
+                    # rejected. Keep the capability flag so a *new* hit in tests
+                    # is still an expansion that needs a human, but do not
+                    # hard-deny.
                     effective = NOTE
                     snippet = f"{snippet} (test file; note only)"
                 findings.append(Finding(rule, effective, rel, line, snippet))
@@ -312,6 +314,8 @@ def scan_tree(root: Path) -> tuple[list[Finding], Capabilities]:
     return findings, caps
 
 
+# BLOCK rules that drop to NOTE inside a test path (see scan_tree).
+TEST_NOTE_RULES = {"eval_dynamic", "pipe_to_shell"}
 TEST_DIR_NAMES = {"test", "tests", "__tests__", "spec", "specs"}
 TEST_FILE_RE = re.compile(r"(?:[._-]test|[._-]spec)\.[cm]?js$", re.IGNORECASE)
 

