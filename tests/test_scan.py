@@ -165,6 +165,36 @@ home = "~/.ssh/id_rsa"
             findings, _caps = scan_tree(root)
             self.assertTrue(has_block_findings(findings))
 
+    def test_eval_named_function_in_native_source_is_not_eval_dynamic(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            write(root, "manifest.json", '{"kinds":["bar-widget"]}')
+            write(root, "Main.qml", "Item {}\n")
+            write(
+                root,
+                "src/tray/hypr_linux.rs",
+                'fn eval(lua: &str) {}\nfn place() { eval("hl.window_rule()"); }\n',
+            )
+            write(root, "src/eval.go", "func run() { eval(cmd) }\n")
+            findings, caps = scan_tree(root)
+            self.assertEqual([item for item in findings if item.rule == "eval_dynamic"], [])
+            self.assertFalse(has_block_findings(findings))
+            self.assertFalse(caps.flags["eval_dynamic"])
+            # Native code is still a capability a human has to accept.
+            self.assertTrue(caps.flags["native_source"])
+            self.assertIn("flag:native_source", capability_expansion(Capabilities(), caps))
+            # eval in QML/JS, Python and shell still blocks.
+            for name, body in (
+                ("Model.qml", "Item { Component.onCompleted: eval(src) }\n"),
+                ("helper.py", "eval(payload)\n"),
+                ("run.sh", 'eval("$cmd")\n'),
+            ):
+                with self.subTest(name=name):
+                    write(root, name, body)
+                    findings, _caps = scan_tree(root)
+                    self.assertTrue(has_block_findings(findings))
+                    (root / name).unlink()
+
     def test_pipe_to_shell_in_test_files_is_a_note_but_still_a_flag(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
