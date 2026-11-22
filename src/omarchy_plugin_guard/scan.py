@@ -281,6 +281,8 @@ def scan_tree(root: Path) -> tuple[list[Finding], Capabilities]:
 
         test_path = is_test_path(rel)
         for rule, severity, pattern in CONTENT_RULES:
+            if suffix in RULE_SKIP_SUFFIXES.get(rule, ()):
+                continue
             for match in pattern.finditer(text):
                 line = text.count("\n", 0, match.start()) + 1
                 snippet = _clip(match.group(0))
@@ -313,6 +315,14 @@ def scan_tree(root: Path) -> tuple[list[Finding], Capabilities]:
     )
     return findings, caps
 
+
+# Rules that mean nothing in some languages. Rust, Go and C/C++ have no
+# runtime `eval`, so `eval(` there is just a function someone named eval (for
+# example a helper that runs `hyprctl eval`). Native source is still flagged
+# through `native_source`, so new native code still needs a human.
+RULE_SKIP_SUFFIXES: dict[str, frozenset[str]] = {
+    "eval_dynamic": frozenset(NATIVE_SOURCE_SUFFIXES),
+}
 
 # BLOCK rules that drop to NOTE inside a test path (see scan_tree).
 TEST_NOTE_RULES = {"eval_dynamic", "pipe_to_shell"}
